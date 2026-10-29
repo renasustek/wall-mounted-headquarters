@@ -1,0 +1,23 @@
+[project]
+name = "wall-mounted-headquarters"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = ["fastapi", "uvicorn"]
+
+[dependency-groups]
+dev = ["pytest", "httpx", "ruff", "mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ANN"]
+
+[tool.mypy]
+strict = true
+files = ["app", "tests"]
