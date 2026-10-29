@@ -1,0 +1,452 @@
+WALL DASHBOARD - V1 DESIGN DOC AND ROADMAP
+==========================================
+
+Audience: an AI coding agent that will build this from scratch.
+Owner: a single user (the "owner"). Hardware: Raspberry Pi + one monitor on a wall.
+Read the whole document before writing any code.
+
+
+1. INTENT
+---------
+A wall-mounted monitor shows the owner's clock, weather and personal goals
+(weight, LeetCode problems, jobs applied, habits) with manager-style
+red/amber/green pace indicators and projection lines. The owner creates goals
+and logs progress from a phone. Nothing about goals is hardcoded.
+
+The screen changes with time of day:
+  - DAY mode     : clock, date, weather, one tile per goal.
+  - MORNING mode : starts at the alarm time, lasts a configurable window
+                   (default 5 minutes). Shows today's weather, week-so-far
+                   progress, and what to do today to stay on target.
+  - BEDTIME mode : starts at a configurable bedtime. Dimmed. Shows clock,
+                   alarm time, hours of sleep, tomorrow's forecast.
+The screen also acts as an alarm clock (sound at alarm time).
+
+
+2. GOALS, NON-GOALS, ANTI-GOALS
+-------------------------------
+Goals
+  - Create any goal from the phone in under 30 seconds.
+  - Pace maths is correct and unit tested.
+  - Wall screen readable from across a room, updates live when the phone
+    changes something.
+  - Runs unattended on a Pi after power loss (auto-start, no keyboard).
+
+Non-goals for V1 (do NOT build)
+  - Manager/dad messages and end-of-day red/amber/green day rating.
+  - Limit goals (calories), one-off milestone goals.
+  - Multiple users, accounts, or a native phone app.
+  - News, stocks, social feeds, smart-home control.
+
+Anti-goals
+  - A goal type or screen that needs code changes to add a new goal.
+  - Silent failures. If weather or storage fails, the screen shows a visible,
+    non-blocking stale/error marker, never a blank or frozen screen.
+
+
+3. DECISIONS ALREADY MADE BY THE OWNER
+--------------------------------------
+  - Raspberry Pi runs a web app. Phone is the control panel. The wall screen
+    is a browser in kiosk mode showing the same app's /display page.
+  - Three goal types in V1:
+      NUMBER  : enter a value (e.g. weight 90 -> 80 kg).
+      COUNTER : tap to add (e.g. 20 LeetCode problems by 12 Nov).
+      STREAK  : daily yes/no habit (e.g. gym), shows consecutive days.
+  - Creating a goal is a short wizard: pick type -> name + target -> done.
+  - The app derives rates: total over a deadline becomes per-week and
+    per-day; it compares actual vs required pace.
+  - Visuals: red/amber/green status, numbers, projection lines.
+  - Remote access away from home via Tailscale.
+  - Weather via Open-Meteo (free, no API key).
+
+
+4. DECISIONS MADE BY THE DOC AUTHOR (change if you find a reason)
+-----------------------------------------------------------------
+  - Backend: Python 3.12, FastAPI, SQLite (stdlib sqlite3), Server-Sent
+    Events for live updates, pytest + httpx.
+  - Frontend: React + TypeScript + Vite, Vitest + React Testing Library,
+    Playwright for one end-to-end flow. No Next.js (no server rendering
+    needed; avoids a Node process on the Pi).
+  - Frontend is built to static files (`dist/`) and served by FastAPI, so
+    the Pi runs a single Python process and no Node.
+  - Charts: React components rendering SVG (Recharts or hand-built), fed by
+    values the API already computed. The frontend does no pace maths.
+  - Status thresholds (constants in one module):
+      GREEN : actual/expected >= 0.95
+      AMBER : actual/expected >= 0.75
+      RED   : below 0.75
+  - Pace is linear: expected progress is an even spread from start date to
+    deadline. Week starts Monday. Timezone from config.
+  - Morning-mode window default 5 minutes after alarm, configurable.
+  - Auth: one shared token from an env var, stored in a cookie after first
+    visit via a ?token= link. Home network + Tailscale only; never expose
+    to the public internet.
+
+
+5. ENGINEERING RULES (APPLY TO EVERY TASK)
+------------------------------------------
+Process
+  - Strict TDD: write a failing test, run it and see it fail for the right
+    reason, write the minimum code to pass, refactor. One behaviour per
+    cycle. Do not write production code without a failing test first.
+  - Run the full suite before moving to the next task. No task is done with
+    a red or skipped test.
+  - Do not commit or push unless the owner asks. If asked to commit, add no
+    AI attribution, trailers or footers anywhere.
+  - Keep scratch notes prefixed CLAUDENOTE: and remove them before finishing.
+
+Code
+  - Pure functions first. Domain logic has no I/O, no clock, no randomness.
+  - Time is injected (a Clock value or a `now` argument). Never call
+    datetime.now() inside domain code.
+  - Immutable by default: frozen dataclasses, tuples over lists in domain.
+  - No None as a return value for "absent" or "failed". Use an explicit
+    Result (Ok/Err) for failures and an explicit Option-like type or a
+    sentinel dataclass for absence. Errors are values, not exceptions,
+    inside domain and service layers. Exceptions only at I/O boundaries,
+    converted to Err immediately.
+  - Functions are 15 lines or fewer. If longer, split.
+  - Full type hints, mypy --strict clean, ruff clean.
+  - No comments by default. Rename instead. Doc comments state the contract
+    only. A comment is allowed only for a non-obvious constraint (platform
+    quirk, ordering requirement), max 3 lines.
+  - No getters/setters or boilerplate.
+  - Layers depend inward only: domain <- services <- api/ui. Domain imports
+    nothing from the rest of the app.
+
+Tests
+  - Test pyramid: many fast unit tests on pure domain, some integration tests
+    (in-memory SQLite, FastAPI TestClient), a few end-to-end smoke tests.
+  - Tests are deterministic: fixed dates, fake clock, fake weather client.
+  - Test names state behaviour: test_amber_when_between_75_and_95_percent.
+  - Use parametrized tests for boundary values (exactly 0.95, 0.75, day 0,
+    deadline day, past deadline).
+
+
+6. DOMAIN MODEL
+---------------
+Goal (frozen)
+  id, name, kind (NUMBER | COUNTER | STREAK), unit (text, may be empty
+  string), start_value, target_value, start_date, deadline (date),
+  tap_step (COUNTER only, default 1; "+30" for minutes).
+  Direction is derived: target < start means decreasing (weight loss).
+
+Entry (frozen)
+  goal_id, recorded_at (datetime), value.
+  NUMBER: the measured value. COUNTER: the amount added. STREAK: 1 for done.
+
+Settings (frozen)
+  alarm_time, bedtime, morning_window_minutes, timezone, latitude, longitude.
+
+Pure functions to implement (domain/pace.py, domain/streaks.py, domain/modes.py)
+  expected_progress(goal, today) -> fraction 0..1 (clamped)
+  actual_progress(goal, entries) -> fraction (can exceed 1, can be negative
+      if moving the wrong way; weight uses (start - current)/(start - target))
+  status(goal, entries, today) -> GREEN | AMBER | RED
+  required_rate(goal, entries, today) -> per_day, per_week
+  projection(goal, entries, today) -> projected value at deadline from the
+      average rate so far; Err if fewer than 2 data points
+  streak(entries, today) -> consecutive days ending today or yesterday
+  today_plan(goals, entries, today) -> list of plain-text lines, e.g.
+      "1 LeetCode problem", "2 job applications"
+  mode_for(now, settings) -> DAY | MORNING | BEDTIME
+  sleep_duration(now, settings) -> timedelta until alarm
+
+
+7. ARCHITECTURE
+---------------
+  app/
+    domain/       pure types and functions (no I/O)
+    services/     goal service, settings service, weather service (take ports)
+    storage/      SQLite repository implementing the repository port
+    adapters/     Open-Meteo client implementing the weather port
+    api/          FastAPI routes (JSON), SSE endpoint, static file serving
+  frontend/       React + TypeScript + Vite app (src/, tests alongside)
+  tests/          mirrors app/
+  deploy/         systemd units, kiosk script, backup script
+
+Ports (typing.Protocol): GoalRepository, EntryRepository, SettingsRepository,
+WeatherClient, Clock, EventBus. Services receive them by constructor.
+Tests use in-memory or fake implementations.
+
+Routes (JSON unless noted)
+  POST   /api/goals                   create goal (validated)
+  GET    /api/goals                   list goals with computed status
+  PATCH  /api/goals/{id}              edit name/target/deadline
+  DELETE /api/goals/{id}              archive goal
+  POST   /api/goals/{id}/entries      log value or tap
+  DELETE /api/entries/{id}            undo a mistaken entry
+  GET    /api/settings, PUT /api/settings
+  GET    /api/weather                 cached forecast, includes stale flag
+  GET    /events                      SSE stream: "goals-changed", "mode-changed"
+  GET    /                            phone UI (React app, served from dist/)
+  GET    /display                     wall UI (React app route)
+  GET    /api/health                  200 when the app and DB are up
+
+
+8. ROADMAP (BUILD IN THIS ORDER)
+--------------------------------
+Each task lists: goal, tests to write first, how to implement, done when.
+
+TASK 0 - Project scaffold and tooling
+  Goal: empty project where lint, types and tests run green.
+  Tests first: one trivial test proves pytest runs; one test imports each
+    top-level package.
+  How: pyproject.toml (uv or pip), ruff, mypy --strict, pytest, httpx.
+    Create the folder layout in section 7. Scaffold frontend/ with
+    `npm create vite` (React + TS), add Vitest, React Testing Library,
+    eslint, `tsc --noEmit`. Add a `make check` (or script) running ruff,
+    mypy, pytest, eslint, tsc and vitest.
+  Done when: `make check` passes on the empty skeleton, backend and frontend.
+
+TASK 1 - Result type and domain value types
+  Goal: Ok/Err Result, Goal, Entry, Settings, enums, Status.
+  Tests first: Result map/flat_map/unwrap_or behaviour; Goal construction
+    rejects nothing (validation lives in services); direction derived
+    correctly for increasing and decreasing goals.
+  How: frozen dataclasses, Enum for kind/status/mode. Result as a small
+    generic union of two frozen dataclasses with map and flat_map.
+  Done when: types import cleanly and are mypy strict.
+
+TASK 2 - Pace maths: expected, actual, status
+  Goal: the red/amber/green logic.
+  Tests first (parametrized): expected_progress at start, midpoint,
+    deadline, past deadline, zero-length period; actual_progress for
+    counter, increasing number, decreasing number (weight 90->80 at 85 = 0.5);
+    status at exactly 0.95 and 0.75 and just below each; goal with no
+    entries is RED once expected > 0 and GREEN on day 0.
+  How: pure functions in domain/pace.py. Thresholds as named constants.
+  Done when: all boundary cases pass; no function over 15 lines.
+
+TASK 3 - Required rate and projection
+  Goal: per-day and per-week required rate; projected value at deadline.
+  Tests first: 20 problems over 14 days = 10/week and ~1.43/day; after
+    partial progress the required rate rises; past deadline returns Err;
+    projection with 1 data point returns Err; projection for a decreasing
+    weight goal extrapolates correctly.
+  How: required_rate divides remaining by remaining days (floor at 1 day).
+    projection uses least-squares or average rate (pick average; document
+    the choice in the function's doc comment contract).
+  Done when: all pass.
+
+TASK 4 - Streaks and today's plan
+  Goal: streak count and "what to do today" lines.
+  Tests first: streak counts consecutive days; today not yet done does not
+    break a streak that ran through yesterday; a missed day resets to 0;
+    today_plan returns only goals behind pace, rounded up to whole units,
+    with the habit goal listed if not done today; empty list when all
+    goals are green and complete for today.
+  How: pure functions in domain/streaks.py and domain/plan.py.
+  Done when: all pass.
+
+TASK 5 - Screen mode and alarm schedule
+  Goal: decide DAY, MORNING or BEDTIME from the time and settings.
+  Tests first: just before alarm = DAY; alarm minute = MORNING; alarm + 5 min
+    boundary exactly; after window = DAY; at bedtime = BEDTIME; bedtime that
+    crosses midnight (23:00 bedtime, 07:00 alarm); sleep_duration across
+    midnight; morning window of 0 disables morning mode.
+  How: pure mode_for(now, settings) in domain/modes.py. Handle midnight
+    wrap by comparing minutes-of-day with a wrap-aware helper.
+  Done when: all boundary and wrap cases pass.
+
+TASK 6 - SQLite storage
+  Goal: persistent repositories behind the ports.
+  Tests first (against in-memory SQLite, same tests also run against a
+    temp file): save and load a goal; entries returned in order; archived
+    goals hidden by default; settings round trip; schema migration runs
+    twice without error (idempotent).
+  How: storage/sqlite.py with plain SQL, parameterized queries only,
+    a numbered migration list applied at startup. Connection I/O errors
+    are caught at the boundary and returned as Err.
+  Done when: repository contract tests pass for the SQLite implementation.
+
+TASK 7 - Goal service with validation
+  Goal: create, edit, archive goals and log entries with validated input.
+  Tests first: reject empty name; reject deadline before start; reject
+    target equal to start for NUMBER; reject non-positive tap_step; COUNTER
+    start is 0; STREAK needs no target; log entry on archived goal is Err;
+    undo removes the entry; each success publishes "goals-changed" on the
+    event bus (use a fake bus).
+  How: services/goals.py takes repositories, Clock and EventBus. Returns
+    Result. Validation as small pure functions combined with flat_map.
+  Done when: all pass with fakes only (no database, no HTTP).
+
+TASK 8 - REST API
+  Goal: expose the service over HTTP.
+  Tests first (FastAPI TestClient, in-memory storage, fake clock): each
+    route's happy path; 422 on invalid input with a readable message; 401
+    without the token; goals list includes computed status, required rate
+    and projection; settings update validated.
+  How: api/routes.py thin handlers that call services and map Err to HTTP
+    status. No business logic in handlers. Token check as a dependency.
+  Done when: all route tests pass.
+
+TASK 9 - Weather adapter and cache
+  Goal: today and tomorrow forecast, resilient to outages.
+  Tests first (fake HTTP transport): parses an Open-Meteo sample response
+    into a Forecast value; network failure returns the last cached forecast
+    flagged stale; no cache and failure returns Err; cache refreshes after
+    its TTL (default 30 min) using the fake clock.
+  How: adapters/open_meteo.py implementing WeatherClient; services/weather.py
+    holds the cache. Save a real sample response as a test fixture.
+  Done when: all pass; no real network calls in tests.
+
+TASK 10 - Live updates (SSE)
+  Goal: wall screen updates within about 2 seconds of a phone change.
+  Tests first: publishing on the EventBus delivers to a subscribed stream;
+    two subscribers both receive; a disconnected subscriber is removed;
+    mode change event fires when mode_for result changes between ticks.
+  How: in-process EventBus (asyncio queues). /events streams text/event-stream
+    with a 15 s keepalive. A background tick (every 5 s) re-evaluates mode.
+    The tick reads time from the Clock port. Add a dev-only SystemClock
+    variant that starts at the time in env var DEV_NOW (ISO datetime) and
+    then advances in real time; it is ignored unless APP_ENV=dev. Optional
+    DEV_TIME_SCALE (e.g. 60) makes it run faster for watching mode changes.
+  Done when: tests pass and a manual two-tab check shows live updates.
+
+TASK 11 - Phone UI
+  Goal: create goals and log progress from a phone.
+  Tests first (Vitest + React Testing Library, API mocked at the fetch
+    boundary): wizard renders the right fields for each goal type; submitting
+    calls POST /api/goals with the expected body; tap button calls the entry
+    endpoint; undo button removes the last entry; API errors render a
+    readable message. Add one Playwright test for the create-goal flow.
+  How: mobile-first React components. Wizard: choose type -> name/target ->
+    confirm. Goal list with big +1 / log-number / done-today buttons and
+    an undo. Settings page for alarm, bedtime, morning window, location.
+    Typed API client in frontend/src/api. Use `vite-plugin-pwa` for the web
+    manifest and icon so it installs to the home screen. Components are
+    small and presentational; data fetching lives in hooks.
+  Done when: a goal can be created and logged end-to-end on a phone-sized
+    viewport with no console errors.
+
+TASK 12 - Wall display: DAY mode with charts
+  Goal: readable dashboard from across the room.
+  Tests first: chart component given a goal's series renders the actual
+    line, projection line and target line (assert on rendered elements);
+    tile component shows name, value, target and a status class/label;
+    clock formatting helper; a useEventSource hook test with a fake
+    EventSource that triggers a refetch on "goals-changed".
+  How: GoalTile and GoalChart components; /display route uses a
+    useEventSource hook on /events and refetches /api/goals. Colours via
+    CSS classes tied to status; do not rely on colour alone (also show an
+    icon or label). Font size scales with viewport; check at 1920x1080.
+  Done when: tiles update live when a goal is logged from another tab.
+
+TASK 13 - MORNING and BEDTIME modes
+  Goal: the two special screens.
+  Tests first: morning view model contains today's weather, week-so-far
+    per goal and today_plan lines; bedtime view model contains time, alarm,
+    sleep duration and tomorrow's forecast; bedtime view sets a dim CSS
+    class; weather stale flag renders a visible marker. Backend: view-model
+    builders are pure functions with their own pytest tests.
+  How: backend exposes GET /api/display returning the current mode and its
+    view model. React MorningScreen, BedtimeScreen and DayScreen components
+    are chosen by mode; /display switches on "mode-changed".
+  Done when: changing the alarm time in settings switches modes at the right
+    minute (verified with a fake clock in tests and manually once).
+
+TASK 14 - Alarm sound
+  Goal: audible alarm at alarm time, dismissible.
+  Tests first: alarm state machine (IDLE -> RINGING at alarm time ->
+    DISMISSED or auto-silence after a max duration, default 10 min) as a
+    pure function; dismiss endpoint moves it to DISMISSED; already dismissed
+    alarm does not ring again the same day.
+  How: /display plays an audio file while state is RINGING. Kiosk Chromium
+    must launch with --autoplay-policy=no-user-gesture-required or audio
+    is blocked. Dismiss button on the phone UI and a tap target on /display.
+  Done when: the alarm rings once at the set time on the Pi hardware.
+
+TASK 15 - Raspberry Pi deployment
+  Goal: survives reboot and runs with no keyboard.
+  Tests first: a deploy self-check script (shell or Python) that asserts the
+    service answers /api/health with 200, the DB file exists, and the disk
+    has space; run it in CI-style locally.
+  How: build the frontend on the dev PC (`npm run build`) and copy dist/
+    plus the Python app to the Pi; the Pi never installs Node. deploy/ contains
+    - systemd unit for the app (Restart=always, env file for token).
+    - systemd/autostart for Chromium: chromium --kiosk --noerrdialogs
+      --autoplay-policy=no-user-gesture-required http://localhost:8000/display
+    - disable screen blanking and cursor.
+    - avahi hostname so the phone reaches the Pi at pi.local.
+    - nightly SQLite backup (sqlite3 .backup) keeping 14 copies.
+    - Tailscale install notes for remote access.
+    - set timezone and NTP on the Pi.
+  Done when: pulling the power cord and restoring it brings the dashboard
+    back with data intact.
+
+TASK 16 - End-to-end check and README
+  Goal: proof the whole thing works and instructions to run it.
+  Tests first: one end-to-end test with fake clock and fake weather: create
+    a COUNTER goal "20 LeetCode over 14 days", log entries across days,
+    assert status turns AMBER then GREEN, required rate updates, and the
+    morning plan text changes.
+  How: README with setup, env vars, how to run tests, how to deploy to the
+    Pi, how to add a goal.
+  Done when: a fresh clone can run `make check` green and start the app.
+
+
+9. ACCEPTANCE (V1 IS DONE WHEN)
+-------------------------------
+  - Given the owner opens the phone UI, when they create a COUNTER goal of 20
+    problems with a 14-day deadline, then the wall shows a tile with
+    10 per week required and a status colour within 2 seconds.
+  - Given a goal is behind pace, when the morning window opens, then the
+    wall lists how much to do today to get back on target.
+  - Given the time reaches bedtime, then the wall dims and shows the alarm
+    time, sleep duration and tomorrow's forecast.
+  - Given the weather service is unreachable, then the wall shows the last
+    forecast with a stale marker and keeps running.
+  - Given the Pi loses power and restarts, then the dashboard returns on its
+    own with all goals and entries intact.
+  - `make check` (ruff, mypy --strict, pytest) is green.
+
+
+10. DEVELOP AND TEST ON A PC (TASKS 0-14, 16)
+----------------------------------------------
+Everything except task 15 and the hardware checks below is built and tested
+on a normal PC. Do not wait for the Pi.
+
+Run locally
+  - Backend:  APP_ENV=dev uvicorn app.main:app --reload --host 0.0.0.0
+  - Frontend: `npm run dev` in frontend/ (Vite) with a dev proxy for /api and
+    /events to the backend. React hot-reloads on save.
+  - Phone:    open http://<pc-ip>:5173 on a phone on the same wifi. Allow the
+    port through the PC firewall. Tests the wizard and tap-to-log on a real
+    phone.
+  - Wall:     open /display in a browser, press F11 or size the window to
+    1920x1080 to judge readability as it would look on the monitor.
+  - Data:     SQLite file in a git-ignored data/ folder; delete it to reset.
+
+Test layers
+  - Domain, services, API:  `pytest`. Time (Clock) and weather are fakes.
+    No test touches the real clock or network.
+  - React components:       `npm test` (Vitest + React Testing Library).
+  - Whole flow:             `npx playwright test` drives a real browser
+    through create goal -> log -> tile updates, with the backend started
+    against a temp database and the fake/dev clock.
+  - Everything:             `make check`.
+
+Time-based behaviour (morning, bedtime, alarm)
+  - In tests: inject a fake Clock, set it to 06:59 then 07:00, assert the mode
+    and alarm state change. Never sleep in tests.
+  - By eye:   start the app with APP_ENV=dev DEV_NOW=2026-11-02T06:58:00 (and
+    optionally DEV_TIME_SCALE=60) to watch the screen switch modes live.
+  - Alarm sound: test in a desktop browser; click the page once if the
+    browser blocks autoplay (only the Pi kiosk uses the autoplay flag).
+
+Only the Pi can verify (task 15)
+  - Auto-start at boot and Chromium kiosk mode.
+  - Audio out of the monitor over HDMI.
+  - Recovery after pulling the power.
+  - pi.local hostname and Tailscale access.
+  - Real display brightness, blanking and readability from across the room.
+
+11. LATER (OUT OF SCOPE, DESIGN SO THEY CAN BE ADDED)
+-----------------------------------------------------
+  - Manager daily message and red/amber/green day rating (second user,
+    history page, 7-dot row on the wall).
+  - Limit goals (calories) and one-off milestone goals: new Goal kinds with
+    their own pure status function; keep status() dispatching on kind so
+    adding a kind touches one place.
+  - Today's top 3, weekly scorecard, application pipeline stages, calendar.
